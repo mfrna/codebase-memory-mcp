@@ -162,7 +162,7 @@ TEST(agent_clients_registry_is_stable_and_callback_driven) {
         "qoder",     "kimi",        "gitlab-duo",    "rovo-dev", "amp",      "devin",
         "tabnine",   "continue",    "visual-studio", "trae",     "roo-code", "amazon-q",
         "codebuddy", "ibm-bob-ide", "ibm-bob-shell", "pochi",    "pi",       "sourcegraph-cody",
-        "omp",
+        "omp",       "zcode",
     };
     static const uint32_t expected_capabilities[] = {
         CBM_AGENT_CAP_MCP | CBM_AGENT_CAP_SKILL | CBM_AGENT_CAP_AGENT | CBM_AGENT_CAP_HOOK,
@@ -184,6 +184,7 @@ TEST(agent_clients_registry_is_stable_and_callback_driven) {
         CBM_AGENT_CAP_INSTRUCTIONS | CBM_AGENT_CAP_SKILL,
         CBM_AGENT_CAP_MCP,
         CBM_AGENT_CAP_MCP | CBM_AGENT_CAP_SKILL | CBM_AGENT_CAP_AGENT,
+        CBM_AGENT_CAP_MCP | CBM_AGENT_CAP_INSTRUCTIONS | CBM_AGENT_CAP_SKILL,
     };
     ASSERT_EQ(cbm_agent_client_count(), CBM_AGENT_CLIENT_COUNT);
     ASSERT_EQ(CBM_AGENT_CLIENT_COUNT, sizeof(expected) / sizeof(expected[0]));
@@ -343,6 +344,9 @@ TEST(agent_clients_resolve_documented_paths_and_precedence) {
     ASSERT_EQ(cbm_agent_client_resolve_path(CBM_AGENT_CLIENT_DEVIN, &options, path, sizeof(path)),
               0);
     ASSERT_STR_EQ(path, "/home/tester/.config/devin/config.json");
+    ASSERT_EQ(cbm_agent_client_resolve_path(CBM_AGENT_CLIENT_ZCODE, &options, path, sizeof(path)),
+              0);
+    ASSERT_STR_EQ(path, "/home/tester/.zcode/cli/config.json");
 
     options.is_windows = true;
     options.appdata_dir = "/roaming";
@@ -553,6 +557,12 @@ TEST(agent_clients_detect_installed_client_directories_before_mcp_exists) {
     probe.paths[0] = "/home/tester/.pi/agent";
     probe.path_count = 1U;
     ASSERT(cbm_agent_client_detect(CBM_AGENT_CLIENT_PI, &options));
+
+    probe.path_count = 0U;
+    ASSERT(!cbm_agent_client_detect(CBM_AGENT_CLIENT_ZCODE, &options));
+    probe.paths[0] = "/home/tester/.zcode";
+    probe.path_count = 1U;
+    ASSERT(cbm_agent_client_detect(CBM_AGENT_CLIENT_ZCODE, &options));
     PASS();
 }
 
@@ -833,6 +843,7 @@ TEST(agent_clients_json_schemas_are_exact_and_policy_neutral) {
         {CBM_AGENT_CLIENT_IBM_BOB_SHELL, "\"mcpServers\""},
         {CBM_AGENT_CLIENT_POCHI, "\"mcp\""},
         {CBM_AGENT_CLIENT_OMP, "\"type\": \"stdio\""},
+        {CBM_AGENT_CLIENT_ZCODE, "\"servers\""},
     };
     const char *binary = "/opt/Codebase Memory/bin/cbm\\\"special";
     for (size_t i = 0U; i < sizeof(cases) / sizeof(cases[0]); i++) {
@@ -871,14 +882,18 @@ TEST(agent_clients_new_standard_json_profiles_preserve_foreign_entries) {
         CBM_AGENT_CLIENT_IBM_BOB_SHELL,
         CBM_AGENT_CLIENT_POCHI,
         CBM_AGENT_CLIENT_OMP,
+        CBM_AGENT_CLIENT_ZCODE,
     };
     for (size_t i = 0U; i < sizeof(clients) / sizeof(clients[0]); i++) {
         const char *foreign =
             clients[i] == CBM_AGENT_CLIENT_POCHI
                 ? "{\"mcp\":{\"codebase-memory-mcp\":{\"command\":\"foreign\","
                   "\"args\":[]}}}\n"
-                : "{\"mcpServers\":{\"codebase-memory-mcp\":{\"command\":\"foreign\","
-                  "\"args\":[]}}}\n";
+                : (clients[i] == CBM_AGENT_CLIENT_ZCODE
+                       ? "{\"mcp\":{\"servers\":{\"codebase-memory-mcp\":"
+                         "{\"command\":\"foreign\",\"args\":[]}}}}\n"
+                       : "{\"mcpServers\":{\"codebase-memory-mcp\":{\"command\":\"foreign\","
+                         "\"args\":[]}}}\n");
         char *dir = NULL;
         char *path = agent_fixture(foreign, &dir);
         ASSERT_NOT_NULL(path);
@@ -891,6 +906,68 @@ TEST(agent_clients_new_standard_json_profiles_preserve_foreign_entries) {
         free(path);
         th_cleanup(dir);
     }
+    PASS();
+}
+
+TEST(agent_clients_zcode_nested_mcp_servers_lifecycle) {
+    /* Fresh install creates the documented two-level mcp.servers path. */
+    char *dir = NULL;
+    char *path = agent_fixture(NULL, &dir);
+    ASSERT_NOT_NULL(path);
+    ASSERT_EQ(cbm_agent_client_install_mcp(CBM_AGENT_CLIENT_ZCODE, path, "/usr/bin/cbm"),
+              CBM_AGENT_EDIT_OK);
+    char *installed = agent_read(path);
+    ASSERT_NOT_NULL(installed);
+    ASSERT_NOT_NULL(strstr(installed, "\"mcp\""));
+    ASSERT_NOT_NULL(strstr(installed, "\"servers\""));
+    ASSERT_NOT_NULL(strstr(installed, "\"codebase-memory-mcp\""));
+    ASSERT_NOT_NULL(strstr(installed, "\"type\": \"stdio\""));
+    ASSERT_NOT_NULL(strstr(installed, "\"command\": \"/usr/bin/cbm\""));
+    ASSERT_EQ(agent_occurrences(installed, "\"codebase-memory-mcp\""), 1U);
+    free(installed);
+
+    /* Reinstall is idempotent. */
+    ASSERT_EQ(cbm_agent_client_install_mcp(CBM_AGENT_CLIENT_ZCODE, path, "/usr/bin/cbm"),
+              CBM_AGENT_EDIT_OK);
+    installed = agent_read(path);
+    ASSERT_NOT_NULL(installed);
+    ASSERT_EQ(agent_occurrences(installed, "\"codebase-memory-mcp\""), 1U);
+    free(installed);
+
+    /* Sibling user servers and same-name foreign entries are preserved. */
+    const char *with_sibling =
+        "{\"mcp\":{\"servers\":{\"brave-search\":{\"type\":\"http\",\"url\":\"https://x\"}}}}\n";
+    ASSERT_EQ(th_write_file(path, with_sibling), 0);
+    ASSERT_EQ(cbm_agent_client_install_mcp(CBM_AGENT_CLIENT_ZCODE, path, "/usr/bin/cbm"),
+              CBM_AGENT_EDIT_OK);
+    installed = agent_read(path);
+    ASSERT_NOT_NULL(installed);
+    ASSERT_NOT_NULL(strstr(installed, "\"brave-search\""));
+    ASSERT_NOT_NULL(strstr(installed, "\"codebase-memory-mcp\""));
+    free(installed);
+    ASSERT_EQ(cbm_agent_client_remove_mcp(CBM_AGENT_CLIENT_ZCODE, path, "/usr/bin/cbm"),
+              CBM_AGENT_EDIT_OK);
+    installed = agent_read(path);
+    ASSERT_NOT_NULL(installed);
+    ASSERT_NULL(strstr(installed, "\"codebase-memory-mcp\""));
+    ASSERT_NOT_NULL(strstr(installed, "\"brave-search\""));
+    free(installed);
+    ASSERT_EQ(cbm_agent_client_remove_mcp(CBM_AGENT_CLIENT_ZCODE, path, "/usr/bin/cbm"),
+              CBM_AGENT_EDIT_OK);
+
+    const char *foreign =
+        "{\"mcp\":{\"servers\":{\"codebase-memory-mcp\":{\"type\":\"stdio\","
+        "\"command\":\"foreign\",\"args\":[]}}}}\n";
+    ASSERT_EQ(th_write_file(path, foreign), 0);
+    ASSERT_EQ(cbm_agent_client_install_mcp(CBM_AGENT_CLIENT_ZCODE, path, "/usr/bin/cbm"),
+              CBM_AGENT_EDIT_FOREIGN);
+    ASSERT_EQ(cbm_agent_client_remove_mcp(CBM_AGENT_CLIENT_ZCODE, path, "/usr/bin/cbm"),
+              CBM_AGENT_EDIT_FOREIGN);
+    char *after = agent_read(path);
+    ASSERT_STR_EQ(after, foreign);
+    free(after);
+    free(path);
+    th_cleanup(dir);
     PASS();
 }
 
@@ -1367,6 +1444,7 @@ SUITE(agent_clients) {
     RUN_TEST(agent_clients_cody_uses_literal_dotted_key_without_feature_or_permission_edits);
     RUN_TEST(agent_clients_json_schemas_are_exact_and_policy_neutral);
     RUN_TEST(agent_clients_new_standard_json_profiles_preserve_foreign_entries);
+    RUN_TEST(agent_clients_zcode_nested_mcp_servers_lifecycle);
     RUN_TEST(agent_clients_refuse_foreign_and_preserve_modified_entries);
     RUN_TEST(agent_clients_omp_resolves_to_injected_agent_dir_when_provided);
     RUN_TEST(agent_clients_omp_profile_does_not_register_global_instructions_capability);
